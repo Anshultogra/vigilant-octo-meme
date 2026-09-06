@@ -3,13 +3,6 @@
 <head>
 <meta charset="UTF-8">
 <title>Chess</title>
-<link rel="manifest" href="manifest.json">
-<meta name="theme-color" content="#12201a">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<link rel="apple-touch-icon" href="icon-192.png">
 <style>
   :root {
     --light: #ebd9b4;
@@ -114,6 +107,15 @@
     inset: 0;
     background: var(--check);
   }
+  .sq.lastmove::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background: rgba(230, 190, 90, 0.28);
+  }
+  .piece {
+    transition: transform 0.15s ease;
+  }
   .sq .dot {
     position: absolute;
     width: 28%;
@@ -163,6 +165,8 @@
     display: flex;
     gap: 10px;
     margin-top: 4px;
+    flex-wrap: wrap;
+    justify-content: center;
   }
   #controls button {
     font-family: inherit;
@@ -208,6 +212,52 @@
     color: #f4ecd8;
     cursor: pointer;
   }
+
+  #historyPanel {
+    width: min(92vw, 480px);
+    background: var(--panel);
+    border-radius: 12px;
+    padding: 10px 14px;
+    max-height: 130px;
+    overflow-y: auto;
+  }
+  #historyPanel h3 {
+    margin: 0 0 6px;
+    font-size: 0.78rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    opacity: 0.6;
+    font-weight: 600;
+  }
+  #historyList {
+    display: grid;
+    grid-template-columns: auto 1fr 1fr;
+    column-gap: 10px;
+    row-gap: 4px;
+    font-size: 0.88rem;
+  }
+  #historyList .num { opacity: 0.5; text-align: right; }
+  #historyList span { animation: fadeIn 0.2s ease; }
+  @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+
+  #soundToggle {
+    background: #3a2a1a;
+    color: #e8dcc0;
+    border: none;
+    border-radius: 999px;
+    width: 42px;
+    height: 42px;
+    font-size: 1.1rem;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .matdiff {
+    font-size: 0.75rem;
+    opacity: 0.7;
+    margin-left: 4px;
+  }
 </style>
 </head>
 <body>
@@ -235,10 +285,15 @@
     <div class="side" id="capturedByBlack"></div>
   </div>
   <div id="boardWrap"><div id="board"></div></div>
+  <div id="historyPanel">
+    <h3>Moves</h3>
+    <div id="historyList"></div>
+  </div>
   <div id="controls">
     <button id="newGameBtn">New Game</button>
     <button id="undoBtn" class="secondary">Undo</button>
     <button id="flipBtn" class="secondary">Flip Board</button>
+    <button id="soundToggle" title="Toggle sound">🔊</button>
   </div>
 </div>
 
@@ -255,6 +310,59 @@
     w: { p:'♙', n:'♘', b:'♗', r:'♖', q:'♕', k:'♔' },
     b: { p:'♟', n:'♞', b:'♝', r:'♜', q:'♛', k:'♚' }
   };
+
+  // ---------- Sound engine ----------
+  let audioCtx = null;
+  function getAudioCtx() {
+    if (!audioCtx) {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (Ctx) audioCtx = new Ctx();
+    }
+    return audioCtx;
+  }
+  function beep(freq, duration, type, vol, delay) {
+    if (!game.soundOn) return;
+    try {
+      const ctx = getAudioCtx();
+      if (!ctx) return;
+      const t0 = ctx.currentTime + (delay || 0);
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = type || 'sine';
+      osc.frequency.setValueAtTime(freq, t0);
+      gain.gain.setValueAtTime(vol || 0.15, t0);
+      gain.gain.exponentialRampToValueAtTime(0.001, t0 + duration);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(t0);
+      osc.stop(t0 + duration + 0.02);
+    } catch (e) {}
+  }
+  function playMoveSound() { beep(440, 0.07, 'sine', 0.15, 0); }
+  function playCaptureSound() { beep(300, 0.05, 'square', 0.18, 0); beep(200, 0.08, 'square', 0.15, 0.05); }
+  function playCheckSound() { beep(880, 0.09, 'triangle', 0.2, 0); beep(660, 0.09, 'triangle', 0.18, 0.09); }
+  function playGameOverSound() { beep(523, 0.12, 'sawtooth', 0.2, 0); beep(392, 0.12, 'sawtooth', 0.18, 0.13); beep(262, 0.18, 'sawtooth', 0.16, 0.26); }
+
+  // ---------- Algebraic notation ----------
+  function squareName(r, c) { return 'abcdefgh'[c] + (8 - r); }
+  function buildSAN(piece, move, isCheck, isMate) {
+    if (move.flags.castle === 'K') return isMate ? 'O-O#' : (isCheck ? 'O-O+' : 'O-O');
+    if (move.flags.castle === 'Q') return isMate ? 'O-O-O#' : (isCheck ? 'O-O-O+' : 'O-O-O');
+    const letter = { p:'', n:'N', b:'B', r:'R', q:'Q', k:'K' }[piece.type];
+    const capture = move.captured || move.flags.enPassant;
+    let str = '';
+    if (piece.type === 'p') {
+      if (capture) str += 'abcdefgh'[move.from[1]] + 'x';
+      str += squareName(move.to[0], move.to[1]);
+      if (move.flags.promotion) str += '=' + { n:'N', b:'B', r:'R', q:'Q' }[move.promoteTo || 'q'];
+    } else {
+      str += letter;
+      if (capture) str += 'x';
+      str += squareName(move.to[0], move.to[1]);
+    }
+    if (isMate) str += '#'; else if (isCheck) str += '+';
+    return str;
+  }
 
   function initialBoard() {
     const back = ['r','n','b','q','k','b','n','r'];
@@ -280,7 +388,10 @@
     legalTargets: [],
     gameOver: false,
     capturedByWhite: [], // pieces white captured (black pieces)
-    capturedByBlack: []
+    capturedByBlack: [],
+    moveHistory: [],
+    lastMove: null,
+    soundOn: true
   };
 
   function cloneBoard(b) { return b.map(row => row.map(cell => cell ? {...cell} : null)); }
@@ -514,6 +625,9 @@
         if (game.selected && game.selected[0]===r && game.selected[1]===c) {
           sq.classList.add('selected');
         }
+        if (game.lastMove && ((game.lastMove.from[0]===r && game.lastMove.from[1]===c) || (game.lastMove.to[0]===r && game.lastMove.to[1]===c))) {
+          sq.classList.add('lastmove');
+        }
         if (kingPos && kingPos[0]===r && kingPos[1]===c) {
           sq.classList.add('check');
         }
@@ -553,8 +667,42 @@
 
     capWhiteEl.innerHTML = game.capturedByWhite.map(p => PIECE_GLYPH[p.color][p.type]).join(' ');
     capBlackEl.innerHTML = game.capturedByBlack.map(p => PIECE_GLYPH[p.color][p.type]).join(' ');
+    renderMaterialDiff();
+    renderHistory();
 
     updateStatus();
+  }
+
+  function renderMaterialDiff() {
+    const val = { p:1, n:3, b:3, r:5, q:9, k:0 };
+    const wGain = game.capturedByWhite.reduce((s,p) => s + val[p.type], 0);
+    const bGain = game.capturedByBlack.reduce((s,p) => s + val[p.type], 0);
+    const diff = wGain - bGain;
+    if (diff > 0) {
+      capWhiteEl.innerHTML += '<span class="matdiff">+' + diff + '</span>';
+    } else if (diff < 0) {
+      capBlackEl.innerHTML += '<span class="matdiff">+' + (-diff) + '</span>';
+    }
+  }
+
+  function renderHistory() {
+    const listEl = document.getElementById('historyList');
+    listEl.innerHTML = '';
+    for (let i = 0; i < game.moveHistory.length; i += 2) {
+      const num = Math.floor(i/2) + 1;
+      const numEl = document.createElement('div');
+      numEl.className = 'num';
+      numEl.textContent = num + '.';
+      const whiteEl = document.createElement('span');
+      whiteEl.textContent = game.moveHistory[i] || '';
+      const blackEl = document.createElement('span');
+      blackEl.textContent = game.moveHistory[i+1] || '';
+      listEl.appendChild(numEl);
+      listEl.appendChild(whiteEl);
+      listEl.appendChild(blackEl);
+    }
+    const panel = document.getElementById('historyPanel');
+    panel.scrollTop = panel.scrollHeight;
   }
 
   function updateStatus() {
@@ -628,6 +776,7 @@
 
   function finalizeMove(move) {
     const piece = game.board[move.from[0]][move.from[1]];
+    const wasCapture = !!(move.captured || move.flags.enPassant);
     const result = applyMove(game.board, move, game.castling);
     game.board = result.board;
     game.castling = result.castling;
@@ -642,11 +791,23 @@
     game.turn = opposite(game.turn);
     game.selected = null;
     game.legalTargets = [];
+    game.lastMove = { from: move.from, to: move.to };
 
-    if (!endGameCheck()) {
+    const isOver = endGameCheck();
+    const isCheck = isInCheck(game, game.turn);
+    const isMate = isOver && isCheck;
+    game.moveHistory.push(buildSAN(piece, move, isCheck, isMate));
+
+    if (isMate) playGameOverSound();
+    else if (isCheck) playCheckSound();
+    else if (wasCapture) playCaptureSound();
+    else playMoveSound();
+
+    if (!isOver) {
       render();
       if (game.mode === 'ai' && game.turn === 'b') {
-        setTimeout(aiMove, 350);
+        statusEl.textContent = 'Computer is thinking…';
+        setTimeout(aiMove, 400);
       }
       if (game.mode === 'online') {
         pushRoomState();
@@ -678,21 +839,50 @@
   // ---------- Simple AI ----------
   const PIECE_VALUE = { p:100, n:320, b:330, r:500, q:900, k:20000 };
 
+  function positionalScore(type, color, r, c) {
+    const centerDist = Math.abs(3.5 - r) + Math.abs(3.5 - c);
+    let score = 0;
+    if (type === 'n' || type === 'b') {
+      score += (7 - centerDist) * 4;
+    }
+    if (type === 'p') {
+      const advancement = color === 'w' ? (6 - r) : (r - 1);
+      score += advancement * 8;
+      if (c >= 2 && c <= 5) score += 6;
+    }
+    if (type === 'q') {
+      score += (7 - centerDist);
+    }
+    if (type === 'k') {
+      const backRank = color === 'w' ? 7 : 0;
+      if (r === backRank) score += 12;
+    }
+    return score;
+  }
+
   function evaluate(state) {
     let score = 0;
     for (let r=0;r<8;r++) for (let c=0;c<8;c++) {
       const p = state.board[r][c];
       if (!p) continue;
-      const val = PIECE_VALUE[p.type];
+      const val = PIECE_VALUE[p.type] + positionalScore(p.type, p.color, r, c);
       score += p.color === 'b' ? val : -val;
     }
     return score;
   }
 
+  function orderMoves(moves) {
+    return moves.slice().sort((a, b) => {
+      const av = a.captured ? PIECE_VALUE[a.captured.type] : (a.flags.promotion ? 800 : 0);
+      const bv = b.captured ? PIECE_VALUE[b.captured.type] : (b.flags.promotion ? 800 : 0);
+      return bv - av;
+    });
+  }
+
   function minimax(state, depth, alpha, beta, maximizing) {
     if (depth === 0) return evaluate(state);
     const color = maximizing ? 'b' : 'w';
-    const moves = allLegalMoves(state, color);
+    const moves = orderMoves(allLegalMoves(state, color));
     if (moves.length === 0) {
       if (isInCheck(state, color)) return maximizing ? -99999+depth : 99999-depth;
       return 0;
@@ -749,7 +939,7 @@
 
   function aiMove() {
     if (game.gameOver) return;
-    const moves = allLegalMoves(game, 'b');
+    const moves = orderMoves(allLegalMoves(game, 'b'));
     if (moves.length === 0) { endGameCheck(); render(); return; }
     let best = -Infinity;
     let bestMoves = [];
@@ -764,6 +954,7 @@
     }
     const chosen = bestMoves[Math.floor(Math.random()*bestMoves.length)];
     const piece = game.board[chosen.from[0]][chosen.from[1]];
+    const wasCapture = !!(chosen.captured || chosen.flags.enPassant);
     const result = applyMove(game.board, chosen, game.castling);
     game.board = result.board;
     game.castling = result.castling;
@@ -774,7 +965,19 @@
     }
     game.history.push({ move: chosen, prevTurn: game.turn });
     game.turn = opposite(game.turn);
-    if (!endGameCheck()) render(); else render();
+    game.lastMove = { from: chosen.from, to: chosen.to };
+
+    const isOver = endGameCheck();
+    const isCheck = isInCheck(game, game.turn);
+    const isMate = isOver && isCheck;
+    game.moveHistory.push(buildSAN(piece, chosen, isCheck, isMate));
+
+    if (isMate) playGameOverSound();
+    else if (isCheck) playCheckSound();
+    else if (wasCapture) playCaptureSound();
+    else playMoveSound();
+
+    render();
   }
 
   // ---------- Online multiplayer (room-based, polling shared storage) ----------
@@ -809,6 +1012,8 @@
       gameOver: game.gameOver,
       statusText: statusEl.textContent,
       moveCount: onlineMoveCount,
+      moveHistory: game.moveHistory,
+      lastMove: game.lastMove,
       whiteJoined: true,
       blackJoined: true
     }, extra || {});
@@ -834,6 +1039,8 @@
     game.capturedByWhite = state.capturedByWhite;
     game.capturedByBlack = state.capturedByBlack;
     game.gameOver = state.gameOver;
+    game.moveHistory = state.moveHistory || [];
+    game.lastMove = state.lastMove || null;
     game.selected = null;
     game.legalTargets = [];
     onlineMoveCount = state.moveCount;
@@ -935,6 +1142,10 @@
   document.getElementById('newGameBtn').addEventListener('click', newGame);
   document.getElementById('flipBtn').addEventListener('click', () => { game.flipped = !game.flipped; render(); });
   document.getElementById('undoBtn').addEventListener('click', undo);
+  document.getElementById('soundToggle').addEventListener('click', () => {
+    game.soundOn = !game.soundOn;
+    document.getElementById('soundToggle').textContent = game.soundOn ? '🔊' : '🔇';
+  });
 
   function setMode(mode) {
     game.mode = mode;
@@ -959,6 +1170,8 @@
     game.gameOver = false;
     game.capturedByWhite = [];
     game.capturedByBlack = [];
+    game.moveHistory = [];
+    game.lastMove = null;
     render();
   }
 
@@ -974,6 +1187,8 @@
     game.capturedByWhite = [];
     game.capturedByBlack = [];
     game.gameOver = false;
+    game.moveHistory = [];
+    game.lastMove = null;
     for (const h of target) {
       const piece = game.board[h.move.from[0]][h.move.from[1]];
       const result = applyMove(game.board, h.move, game.castling);
@@ -985,6 +1200,9 @@
         else game.capturedByBlack.push(h.move.captured);
       }
       game.turn = opposite(game.turn);
+      game.lastMove = { from: h.move.from, to: h.move.to };
+      const isCheck = isInCheck(game, game.turn);
+      game.moveHistory.push(buildSAN(piece, h.move, isCheck, false));
     }
     game.history = target;
     game.selected = null;
@@ -993,12 +1211,6 @@
   }
 
   newGame();
-
-  if ('serviceWorker' in navigator) {
-    window.addEventListener('load', () => {
-      navigator.serviceWorker.register('sw.js').catch(() => {});
-    });
-  }
 })();
 </script>
 </body>
